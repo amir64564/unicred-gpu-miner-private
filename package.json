@@ -8,6 +8,8 @@
   "scripts": {
     "mine": "node mine.mjs",
     "verify": "node verify-hash.mjs",
+    "verify:cpu": "node scripts/cross-check-cpu.mjs",
+    "check": "node --check mine.mjs && node --check lib/keccak_core.mjs && node --check verify-hash.mjs",
     "benchmark": "node mine.mjs --benchmark --cpu-only",
     "build:cuda": "bash cuda/build.sh"
   },

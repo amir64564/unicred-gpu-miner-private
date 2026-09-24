@@ -127,9 +127,15 @@ async function cpuSearchBatch(prep, targetHi, targetLo, hiWord, start, count, th
       const w = new Worker(SELF, {
         workerData: { mid, tailLanes, targetHi, targetLo, hiWord, start: startOff, count: n },
       });
-      w.on('message', resolve);
-      w.on('error', reject);
-      w.on('exit', (c) => { if (c !== 0) reject(new Error('worker exit ' + c)); });
+      let settled = false;
+      const ok = (msg) => { if (!settled) { settled = true; resolve(msg); } };
+      const bad = (e) => { if (!settled) { settled = true; reject(e); } };
+      w.on('message', ok);
+      w.on('error', bad);
+      w.on('exit', (c) => {
+        if (c !== 0) bad(new Error('worker exit ' + c));
+        else setImmediate(() => { if (!settled) ok({ hit: -1, scanned: n }); });
+      });
     }));
     offset = (offset + n) >>> 0;
     left -= n;
@@ -172,6 +178,7 @@ class CudaPool {
     this.proc.stdin.write(JSON.stringify(obj) + '\n');
   }
   setJob(job) { this.send({ cmd: 'job', ...job }); }
+  idle() { this.send({ cmd: 'idle' }); }
   stop() { try { this.send({ cmd: 'stop' }); this.proc?.kill('SIGTERM'); } catch { /* */ } }
 }
 
@@ -237,20 +244,33 @@ async function main() {
   let submitting = false;
   const gpuRates = {};
 
+  // Must match the address embedded in the PoW digest / targetFor(miner).
+  const PLACEHOLDER_MINER = '0x1111111111111111111111111111111111111111';
+  const miningAddress = () => pickWallet()?.address || PLACEHOLDER_MINER;
+
   async function refresh() {
-    const who = pickWallet()?.address || ethers.ZeroAddress;
-    const st = await withRpc(providers, (p) => nft(p).state(who));
-    return {
-      minted: Number(st.minted),
-      price: st.price,
-      prev: st.prev,
-      baseTarget: st.baseTarget,
-      target: st.yourTarget,
-      field: Number(st.field),
-      yours: Number(st.yours),
-      block: Number(st.blockNumber),
-      mintedThisBlock: st.mintedThisBlock,
-    };
+    const who = miningAddress();
+    // Prefer the highest tip among RPCs (public endpoints can lag each other).
+    let best = null, lastErr;
+    for (const prov of providers) {
+      try {
+        const st = await nft(prov).state(who);
+        const row = {
+          minted: Number(st.minted),
+          price: st.price,
+          prev: st.prev,
+          baseTarget: st.baseTarget,
+          target: st.yourTarget,
+          field: Number(st.field),
+          yours: Number(st.yours),
+          block: Number(st.blockNumber),
+          mintedThisBlock: st.mintedThisBlock,
+        };
+        if (!best || row.block > best.block) best = row;
+      } catch (e) { lastErr = e; }
+    }
+    if (!best) throw lastErr || new Error('all RPCs failed');
+    return best;
   }
 
   async function buildJob(st, minerAddr) {
@@ -330,28 +350,48 @@ async function main() {
       if (!go) { console.log('[unicred] skipped'); return; }
 
       const winfo = wallets.find((w) => w.address.toLowerCase() === j.miner.toLowerCase()) || pickWallet();
-      const provider = providers[0];
-      const wallet = new ethers.Wallet(winfo.key, provider);
-      const c = nft(provider).connect(wallet);
-      const fee = await provider.getFeeData();
-      const tip = (fee.maxPriorityFeePerGas && fee.maxPriorityFeePerGas > 0n) ? fee.maxPriorityFeePerGas : 1_000_000n;
-      const maxFee = (fee.maxFeePerGas && fee.maxFeePerGas > tip * 2n) ? fee.maxFeePerGas : tip * 20n;
+      if (!winfo) { console.error('[unicred] no wallet for miner'); return; }
 
-      await c.mine.staticCall(j.anchor, nonce, price, { value: price });
-      const tx = await c.mine(j.anchor, nonce, price, {
-        value: price, gasLimit: 450_000n, maxPriorityFeePerGas: tip, maxFeePerGas: maxFee,
-      });
-      console.log(`[unicred] tx ${tx.hash} waiting…`);
-      const rc = await tx.wait();
-      console.log(`[unicred] CONFIRMED block=${rc.blockNumber} ${EXPLORER}/tx/${tx.hash}`);
-      wins++;
-      walletIdx++;
-      if (wins >= args.maxMints) {
-        console.log('[unicred] max-mints reached');
-        process.exit(0);
+      let lastErr;
+      let submitted = false;
+      for (const provider of providers) {
+        try {
+          const wallet = new ethers.Wallet(winfo.key, provider);
+          const c = nft(provider).connect(wallet);
+          const fee = await provider.getFeeData();
+          const tip = (fee.maxPriorityFeePerGas && fee.maxPriorityFeePerGas > 0n)
+            ? fee.maxPriorityFeePerGas : 1_000_000n;
+          const maxFee = (fee.maxFeePerGas && fee.maxFeePerGas > tip * 2n)
+            ? fee.maxFeePerGas : tip * 20n;
+
+          await c.mine.staticCall(j.anchor, nonce, price, { value: price });
+          const tx = await c.mine(j.anchor, nonce, price, {
+            value: price, gasLimit: 450_000n, maxPriorityFeePerGas: tip, maxFeePerGas: maxFee,
+          });
+          console.log(`[unicred] tx ${tx.hash} waiting…`);
+          const rc = await tx.wait();
+          console.log(`[unicred] CONFIRMED block=${rc.blockNumber} ${EXPLORER}/tx/${tx.hash}`);
+          wins++;
+          walletIdx++;
+          job = null;
+          if (cuda) cuda.idle();
+          submitted = true;
+          if (wins >= args.maxMints) {
+            console.log('[unicred] max-mints reached');
+            process.exit(0);
+          }
+          break;
+        } catch (e) {
+          lastErr = e;
+          const msg = e.shortMessage || e.reason || e.message || String(e);
+          console.error(`[unicred] submit via RPC failed: ${msg}`);
+          // Non-retryable proof/anchor/price errors — do not hammer other RPCs
+          if (/BadProof|BadAnchor|PriceMoved|Underpaid|OneMintPerBlock|SoldOut/i.test(msg)) break;
+        }
       }
+      if (!submitted && lastErr) throw lastErr;
     } catch (e) {
-      console.error('[unicred] submit error:', e.shortMessage || e.message);
+      console.error('[unicred] submit error:', e.shortMessage || e.reason || e.message);
     } finally {
       submitting = false;
     }
@@ -388,7 +428,7 @@ async function main() {
         if (lastMinted >= 0) console.log(`[unicred] #${st.minted} mined on-chain — new race`);
         lastMinted = st.minted;
       }
-      const minerAddr = pickWallet()?.address || '0x1111111111111111111111111111111111111111';
+      const minerAddr = miningAddress();
       const stale = !job
         || job.prev !== st.prev
         || job.target !== st.target
@@ -410,6 +450,10 @@ async function main() {
       }
 
       if (!job || submitting || st.mintedThisBlock) {
+        if (cuda && st.mintedThisBlock) {
+          cuda.idle(); // pause GPUs until next block (one mint per block)
+          job = null;
+        }
         await new Promise((r) => setTimeout(r, args.pollMs));
         continue;
       }
@@ -424,15 +468,13 @@ async function main() {
       const results = await cpuSearchBatch(myJob.prep, myJob.targetHi, myJob.targetLo, hiWord, ctr, BATCH, args.threads);
       if (job !== myJob) continue;
       let scanned = 0;
+      let hitCtr = -1;
       for (const r of results) {
         scanned += r.scanned;
-        if (r.hit >= 0) {
-          hashesWindow += scanned;
-          await verifyAndSubmit(myJob, hiWord, r.hit >>> 0);
-          break;
-        }
+        if (r.hit >= 0 && hitCtr < 0) hitCtr = r.hit >>> 0;
       }
       hashesWindow += scanned;
+      if (hitCtr >= 0) await verifyAndSubmit(myJob, hiWord, hitCtr);
       ctr = (ctr + BATCH) >>> 0;
     } catch (e) {
       console.error('[unicred] loop:', e.shortMessage || e.message);

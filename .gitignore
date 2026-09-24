@@ -3,6 +3,7 @@ node_modules/
 .env.*
 !.env.example
 cuda/unicred-cuda
+cuda/unicred_cpu_ref
 *.o
 solutions/
 last-solution.json

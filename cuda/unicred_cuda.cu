@@ -28,11 +28,7 @@ __device__ void keccak_f_u32(uint32_t s[50]) {
     0x80000000,0x80000000,0x00000000,0x80000000,0x80000000,0x80000000,0x00000000,0x80000000
   };
   const int ROT[25] = {0,1,62,28,27,36,44,6,55,20,3,10,43,25,39,41,45,15,21,8,18,2,61,56,14};
-  const int PI[25] = {
-    0,10,20,5,15,16,1,11,21,6,7,17,2,12,22,23,8,18,3,13,14,24,9,19,4
-  };
-  // Precomputed PI: dest = y + 5*((2x+3y)%5) for x+5y — match keccak_core.js
-  // Rebuild PI like JS for safety
+  // PI dest = y + 5*((2x+3y)%5) — match lib/keccak_core.mjs
   int pi[25];
   for (int x = 0; x < 5; x++) for (int y = 0; y < 5; y++)
     pi[x + 5 * y] = y + 5 * ((2 * x + 3 * y) % 5);
@@ -94,7 +90,7 @@ __global__ void mine_kernel(
   keccak_f_u32(s);
   uint32_t top = bswap32(s[0]);
   uint32_t nxt = bswap32(s[1]);
-  if (top < tHi || (top == tHi && nxt < tLo)) {
+  if (top < tHi || (top == tHi && nxt <= tLo)) {
     if (atomicCAS(out, 0, 1) == 0) out[1] = ctr;
   }
 }
@@ -143,7 +139,7 @@ static bool parse_job(const std::string& line, Job& j) {
   return true;
 }
 
-void gpu_loop(int dev) {
+void gpu_loop(int dev, int nDev) {
   cudaSetDevice(dev);
   uint32_t *d_base = nullptr, *d_out = nullptr;
   cudaMalloc(&d_base, 50 * sizeof(uint32_t));
@@ -152,6 +148,7 @@ void gpu_loop(int dev) {
   int groups = 4096;
   uint32_t ctr = 0;
   uint64_t lastJob = 0;
+  uint32_t myHi = 0;
   uint32_t hiSw = 0;
 
   while (g_run.load()) {
@@ -166,7 +163,9 @@ void gpu_loop(int dev) {
     }
     if (job.jobId != lastJob) {
       cudaMemcpy(d_base, job.base, 50 * sizeof(uint32_t), cudaMemcpyHostToDevice);
-      hiSw = bswap_host(job.hiWord);
+      // Unique hiWord per GPU so devices never search the same nonce space.
+      myHi = job.hiWord + (uint32_t)dev;
+      hiSw = bswap_host(myHi);
       ctr = 0;
       lastJob = job.jobId;
       groups = 4096;
@@ -186,10 +185,15 @@ void gpu_loop(int dev) {
     fflush(stdout);
     if (out[0]) {
       printf("{\"event\":\"found\",\"jobId\":%llu,\"hiWord\":%u,\"ctr\":%u,\"gpu\":%d}\n",
-             (unsigned long long)job.jobId, job.hiWord, out[1], dev);
+             (unsigned long long)job.jobId, myHi, out[1], dev);
       fflush(stdout);
     }
+    uint32_t prevCtr = ctr;
     ctr += (uint32_t)batch;
+    if (ctr < prevCtr) { // uint32 wrap — advance hiWord, keep GPUs disjoint
+      myHi += (uint32_t)(nDev > 0 ? nDev : 1);
+      hiSw = bswap_host(myHi);
+    }
     if (ms < 25 && groups < 65535) groups = groups * 2 > 65535 ? 65535 : groups * 2;
     else if (ms > 80 && groups > 64) groups /= 2;
   }
@@ -208,11 +212,16 @@ int main(int argc, char** argv) {
   printf("{\"event\":\"ready\",\"gpus\":%d}\n", n);
   fflush(stdout);
   std::vector<std::thread> threads;
-  for (int i = 0; i < n; i++) threads.emplace_back(gpu_loop, i);
+  for (int i = 0; i < n; i++) threads.emplace_back(gpu_loop, i, n);
 
   std::string line;
   while (std::getline(std::cin, line)) {
     if (line.find("\"cmd\":\"stop\"") != std::string::npos) break;
+    if (line.find("\"cmd\":\"idle\"") != std::string::npos) {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g_job.valid = false;
+      continue;
+    }
     if (line.find("\"cmd\":\"job\"") != std::string::npos) {
       Job j;
       if (parse_job(line, j)) {

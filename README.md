@@ -15,6 +15,7 @@ See **README-VPS.md** for rental setup. See **PROTOCOL.md** for exact PoW.
 npm i
 node verify-hash.mjs          # must print ok:true
 node mine.mjs --benchmark --cpu-only
+node scripts/cross-check-cpu.mjs  # C kernel vs JS (no GPU)
 bash setup-on-rental.sh       # on GPU VPS
 ```
 
