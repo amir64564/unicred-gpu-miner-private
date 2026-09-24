@@ -1,0 +1,16 @@
+{
+  "name": "unicred-miner",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Fast CUDA/CPU miner for UNICRED PoW NFT on Unichain",
+  "bin": { "unicred-mine": "./mine.mjs" },
+  "scripts": {
+    "mine": "node mine.mjs",
+    "verify": "node verify-hash.mjs",
+    "benchmark": "node mine.mjs --benchmark --cpu-only",
+    "build:cuda": "bash cuda/build.sh"
+  },
+  "dependencies": { "ethers": "^6.13.0" },
+  "engines": { "node": ">=20" }
+}

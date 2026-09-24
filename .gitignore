@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.*
+!.env.example
+cuda/unicred-cuda
+*.o
+solutions/
+last-solution.json
+*.log
+.DS_Store
